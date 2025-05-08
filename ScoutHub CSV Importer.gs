@@ -1,6 +1,7 @@
 /********************************************
 * SCOUTHUB CSV IMPORT SCRIPT v3.2
-*
+* Test Commit logic to GitHub
+* 
 * SUMMARY:
 * Imports ScoutHub Member Data from a CSV file.
 * Uses the CSV Export from ScoutHub and writes the import to a column structure matching your current member data
