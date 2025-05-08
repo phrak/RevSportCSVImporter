@@ -1,5 +1,5 @@
 /********************************************
-* SCOUTHUB CSV IMPORT SCRIPT v3.1
+* SCOUTHUB CSV IMPORT SCRIPT v3.2
 *
 * SUMMARY:
 * Imports ScoutHub Member Data from a CSV file.
@@ -81,19 +81,22 @@ const CONFIG_SHEET_NAME = 'Import Config';
 *********************************/
 function onOpen() {
   const ui = SpreadsheetApp.getUi();
-  
-  ui.createMenu('⚙️ CSV Importer')
-    .addItem('🚀 1. Run Full Import', 'importScoutHubCSV')
-    .addItem('🚀 2. Run All Transforms', 'runAllTransforms')
-    .addItem('🚀 3. Flag Changes', 'compareAndFlagChanges')
+
+  ui.createMenu('⚙️ ScoutHub CSV Importer')
     .addSubMenu(
       ui.createMenu('🛠️ Setup & Config')
         .addItem('1. Initialize Config Sheet', 'createConfigSheet')
-        .addItem('2. Update Column Mappings', 'updateColumnMappings')
     )
+    .addSeparator()
+    .addItem('📥 1. Import ScoutHub CSV from URL', 'importScoutHubCSV')
+    .addItem('✏️ 2. Get/Refresh Column Mappings', 'updateColumnMappings')
+    .addItem('🗺️ 3. Map ScoutHub to your Table Structure ', 'mapCSVData')
+    .addItem('⚙️ 4. Run All Data Transforms', 'runAllTransforms')
+    .addItem('🚩 5. Flag Changes', 'compareAndFlagChanges')
+    .addItem('🆔 6. Update Member Numbers', 'updateMemberNumbers')
+    .addSeparator()
     .addSubMenu(
       ui.createMenu('🔧 Data Transformations')
-	  // ALL TRANSFORMATIONS EXIST IN THE SEPARATE "IMPORT SCOUTHUB TRANSFORMATIONS" SCRIPT
         .addItem('🚀 Run All Transforms', 'runAllTransforms')
         .addSeparator()
         .addItem('📞 Normalize Numbers', 'normalizePhoneNumbers')
@@ -101,8 +104,9 @@ function onOpen() {
         .addItem('📧 De-duplicate Emails', 'deduplicateEmails')
         .addItem('👪 Split Parent Names', 'applyParentNameSplitting')
         .addItem('👪 Populate Preferred Names', 'applyPreferredNamePopulation')
-        .addItem('Sort by Member Number', 'sortByMemberNumber')
+        .addItem('🔢 Sort by Member Number', 'sortByMemberNumber')
     )
+    .addSeparator()
     .addSubMenu(
       ui.createMenu('⚡ Tools')
         .addItem('Clear All Caches', 'clearTransformCaches')
@@ -131,7 +135,7 @@ function showDocumentation() {
 
 
 /*********************************
-* 3. CONFIG SHEET CREATION
+* 3. SETUP CONFIG SHEET & OTHERS
 * Creates or resets the configuration sheet with:
 * - User-editable settings for source/target sheet names and import options
 * - Dynamic mapping table for column relationships
@@ -147,7 +151,8 @@ function createConfigSheet() {
   const settings = [
     ['Member Source Sheet Name', 'Members'],
     ['Mapped Members Target Sheet Name', 'Scouthub Import'],
-    ['CSV Drive URL', ''],
+    ['ScoutHub CSV Staging Sheet Name', 'ScoutHub CSV'], // Added new setting for staging sheet
+    ['CSV Drive URL', 'https://drive.google.com/open?id=1hw3nTnmj9jY9M_D0a_TWI3xxxxQznoc5&usp=drive_fs'],
     ['Source Start Row', '2'],
     ['Target Start Row', '2'],
     ['Last Import Date', '']
@@ -172,8 +177,19 @@ function createConfigSheet() {
   configSheet.autoResizeColumns(1, 4);
 }
 
+function ensureStagingSheetExists() {
+  const ss = SpreadsheetApp.getActive();
+  const { stagingSheet } = getSheetNamesFromConfig();
+  let sheet = ss.getSheetByName(stagingSheet);
+  if (!sheet) {
+    sheet = ss.insertSheet(stagingSheet);
+    sheet.appendRow(['ScoutHub CSV Staging Sheet - Paste Raw CSV Columns Here']);
+  }
+  return sheet;
+}
+
 /*********************************
-* 4. CONFIG SHEET NAME RETRIEVAL
+* 4. CONFIG SHEET VARIABLE NAME RETRIEVALS
 * Reads the current source and target sheet names from the config sheet.
 * Returns default names if not set.
 *********************************/
@@ -182,14 +198,36 @@ function getSheetNamesFromConfig() {
   const configSheet = ss.getSheetByName(CONFIG_SHEET_NAME);
   if (!configSheet) return {
     memberSource: 'Members',
-    mappedTarget: 'Scouthub Import'
+    mappedTarget: 'Scouthub Import',
+    stagingSheet: 'ScoutHub CSV'
   };
-  const values = configSheet.getRange('B1:B2').getValues().flat();
+  const values = configSheet.getRange('B1:B3').getValues().flat();
   return {
     memberSource: values[0] || 'Members',
-    mappedTarget: values[1] || 'Scouthub Import'
+    mappedTarget: values[1] || 'Scouthub Import',
+    stagingSheet: values[2] || 'ScoutHub CSV'
   };
 }
+
+function getImportConfigParams() {
+  const ss = SpreadsheetApp.getActive();
+  const configSheet = ss.getSheetByName(CONFIG_SHEET_NAME);
+  if (!configSheet) throw new Error("Config sheet missing");
+
+  // Define each config cell explicitly
+  const SHOW_NUMBER_CHANGE_PROMPTS = String(configSheet.getRange("E1").getValue()).toLowerCase() === 'true';
+  const AUTO_UPDATE_NUMBER_CHANGES = String(configSheet.getRange("E2").getValue()).toLowerCase() === 'true';
+  const DEBUG_MODE = String(configSheet.getRange("E3").getValue()).toLowerCase() === 'true';
+  const DATE_INPUT_FORMAT = configSheet.getRange("E4").getValue() || 'International (AU)';
+
+  return {
+    SHOW_NUMBER_CHANGE_PROMPTS,
+    AUTO_UPDATE_NUMBER_CHANGES,
+    DEBUG_MODE,
+    DATE_INPUT_FORMAT
+  };
+}
+
 
 /*********************************
 * 5. FILE ID EXTRACTION
@@ -213,11 +251,24 @@ function extractDriveFileId(url) {
 * - Populates mapping table with standard or existing mappings
 * - Highlights mapped columns for user clarity
 *********************************/
+/**
+ * Updates the column mappings in the configuration sheet.
+ * 
+ * This function:
+ * - Reads member sheet columns and ScoutHub CSV staging sheet columns.
+ * - Loads existing mappings from the config sheet.
+ * - Applies standard mappings only if the corresponding ScoutHub CSV column exists (case-insensitive).
+ * - Ensures all column header comparisons are case-insensitive.
+ * - Writes the updated mapping table back to the config sheet.
+ * - Highlights mapped columns for clarity.
+ * 
+ * Alerts the user on completion or errors.
+ */
 function updateColumnMappings() {
   const ss = SpreadsheetApp.getActive();
   const configSheet = ss.getSheetByName(CONFIG_SHEET_NAME);
   const ui = SpreadsheetApp.getUi();
-  const { memberSource } = getSheetNamesFromConfig();
+  const { memberSource, stagingSheet } = getSheetNamesFromConfig();
 
   // DEFAULT COLUMN MAPPINGS
   // Format: 'Member Sheet Column': 'ScoutHub Column'
@@ -256,13 +307,21 @@ function updateColumnMappings() {
     if (!memberSheet) throw new Error(`'${memberSource}' sheet not found`);
     const memberColumns = memberSheet.getRange(1, 1, 1, memberSheet.getLastColumn()).getValues()[0];
 
-    // Get columns from the ScoutHub CSV
-    const fileId = extractDriveFileId(configSheet.getRange('B3').getValue());
-    if (!fileId) throw new Error('Invalid Google Drive URL in B3');
-    const csvData = Utilities.parseCsv(DriveApp.getFileById(fileId).getBlob().getDataAsString());
-    const scouthubColumns = csvData[0];
+    // Get columns from the ScoutHub CSV staging sheet
+    const stgSheet = ss.getSheetByName(stagingSheet);
+    if (!stgSheet) {
+      ui.alert(`The staging sheet "${stagingSheet}" does not exist. Please import or paste CSV data first.`);
+      return;
+    }
+    const stgData = stgSheet.getDataRange().getValues();
+    if (stgData.length < 1) {
+      ui.alert(`The staging sheet "${stagingSheet}" is empty. Please import or paste CSV data first.`);
+      return;
+    }
+    const scouthubColumns = stgData[0];
+    const scouthubLower = scouthubColumns.map(c => c.toLowerCase());
 
-    // Read any existing user mappings from the config sheet
+    // Load existing mappings from config sheet
     let existingMappings = {};
     const lastRow = configSheet.getLastRow();
     if (lastRow >= 11) {
@@ -271,14 +330,28 @@ function updateColumnMappings() {
       colAValues.forEach((colA, i) => existingMappings[colA] = colBValues[i]);
     }
 
-    // Clear previous mapping table
+    // Clear previous mapping table content
     if (lastRow >= 11) configSheet.getRange(`A11:D${lastRow}`).clearContent();
 
-    // Build new mapping table
+    // Build new mapping table with validation
     const data = [];
     let mappedCount = 0;
     memberColumns.forEach((memberCol, index) => {
-      let mapVal = existingMappings[memberCol] || STANDARD_MAPPINGS[memberCol] || '';
+      let mapVal = existingMappings[memberCol] || '';
+
+      // If no existing mapping, try standard mapping only if it exists in ScoutHub CSV columns (case-insensitive)
+      if (!mapVal && STANDARD_MAPPINGS[memberCol]) {
+        const stdMap = STANDARD_MAPPINGS[memberCol];
+        if (scouthubLower.includes(stdMap.toLowerCase())) {
+          mapVal = stdMap;
+        }
+      }
+
+      // Validate that mapping exists in ScoutHub CSV columns (case-insensitive)
+      if (mapVal && !scouthubLower.includes(mapVal.toLowerCase())) {
+        mapVal = '';
+      }
+
       if (mapVal) mappedCount++;
       data.push([memberCol, mapVal, '', scouthubColumns[index] || '']);
     });
@@ -308,6 +381,87 @@ function updateColumnMappings() {
   }
 }
 
+
+/*********************************
+ * 7. CSV DATA MAPPING TO TARGET
+
+ * Maps raw ScoutHub CSV data from the staging worksheet to the member target sheet.
+ *
+ * Reads raw CSV data from the configured staging sheet,
+ * applies the column mappings defined in the config sheet,
+ * and writes the mapped data to the target member sheet.
+ * 
+ * Matching of column headers is case-insensitive.
+ * 
+ * Updates the last import timestamp in config on success.
+ *********************************/
+function mapCSVData() {
+  const ss = SpreadsheetApp.getActive();
+  const ui = SpreadsheetApp.getUi();
+  const { memberSource, mappedTarget, stagingSheet } = getSheetNamesFromConfig();
+
+  try {
+    const configSheet = ss.getSheetByName(CONFIG_SHEET_NAME);
+    if (!configSheet) throw new Error('Config sheet missing');
+
+    const stgSheet = ss.getSheetByName(stagingSheet);
+    if (!stgSheet) {
+      ui.alert(`The staging sheet "${stagingSheet}" does not exist. Please import or paste CSV data first.`);
+      return;
+    }
+
+    const stgData = stgSheet.getDataRange().getValues();
+    if (stgData.length < 1) {
+      ui.alert(`The staging sheet "${stagingSheet}" is empty. Please import or paste CSV data first.`);
+      return;
+    }
+
+    const stgHeaders = stgData[0];
+    const headerIndices = stgHeaders.reduce((acc, h, i) => {
+      acc[h.toLowerCase()] = i;
+      return acc;
+    }, {});
+
+    const memberSheet = ss.getSheetByName(memberSource);
+    if (!memberSheet) throw new Error(`'${memberSource}' sheet not found`);
+    const memberHeaders = memberSheet.getRange(1, 1, 1, memberSheet.getLastColumn()).getValues()[0];
+
+    const lastRow = configSheet.getLastRow();
+    const mappingRange = configSheet.getRange(`A11:B${lastRow}`);
+    const mappingValues = mappingRange.getValues().filter(([a, b]) => a && b);
+    const mappingData = {};
+    mappingValues.forEach(([memberCol, scoutCol]) => {
+      mappingData[memberCol] = scoutCol;
+    });
+
+    const mappedData = stgData.slice(1).map(row => 
+      memberHeaders.map(memberCol => {
+        const scoutCol = mappingData[memberCol];
+        if (!scoutCol) return '';
+        const colIndex = headerIndices[scoutCol.toLowerCase()];
+        return (colIndex !== undefined) ? row[colIndex] : '';
+      })
+    );
+
+    let targetSheet = ss.getSheetByName(mappedTarget);
+    if (!targetSheet) targetSheet = ss.insertSheet(mappedTarget);
+    targetSheet.clear();
+    targetSheet.appendRow(memberHeaders);
+    if (mappedData.length) {
+      targetSheet.getRange(2, 1, mappedData.length, memberHeaders.length).setValues(mappedData);
+    }
+
+    configSheet.getRange('B7').setValue(new Date());
+    ui.alert(`Mapped ${mappedData.length} records from "${stagingSheet}" to "${mappedTarget}".`);
+  } catch (e) {
+    ui.alert(`Mapping Failed: ${e.message}`);
+    Logger.log(e);
+  }
+}
+
+
+
+
 /*********************************
 * 7. CSV IMPORT ENGINE
 * Imports mapped data from the ScoutHub CSV to the target sheet.
@@ -318,206 +472,369 @@ function updateColumnMappings() {
 function importScoutHubCSV() {
   const ss = SpreadsheetApp.getActive();
   const ui = SpreadsheetApp.getUi();
-  const { memberSource, mappedTarget } = getSheetNamesFromConfig();
+  const { stagingSheet } = getSheetNamesFromConfig();
 
   try {
     const configSheet = ss.getSheetByName(CONFIG_SHEET_NAME);
     if (!configSheet) throw new Error('Config sheet missing');
-    const settings = configSheet.getRange('B3:B5').getValues().flat();
-    const fileId = extractDriveFileId(settings[0]);
-    const sourceStartRow = parseInt(settings[1]) || 2;
-    const targetStartRow = parseInt(settings[2]) || 2;
-
-    const memberSheet = ss.getSheetByName(memberSource);
-    if (!memberSheet) throw new Error(`'${memberSource}' sheet missing`);
-    const memberHeaders = memberSheet.getRange(1, 1, 1, memberSheet.getLastColumn()).getValues()[0];
     
-    // Build mapping from config sheet (A11:B)
-    const mappingData = configSheet.getRange('A11:B' + configSheet.getLastRow())
-      .getValues()
-      .filter(([a,b]) => a && b)
-      .reduce((acc, [a,b]) => (acc[a] = b, acc), {});
-
-    const csvData = Utilities.parseCsv(DriveApp.getFileById(fileId).getBlob().getDataAsString());
-    const headerIndices = csvData[0].reduce((acc, h, i) => (acc[h] = i, acc), {});
-
-    // Map each row from CSV to the member sheet columns
-    const mappedData = csvData.slice(sourceStartRow - 1).map(row => 
-      memberHeaders.map(h => mappingData[h] ? row[headerIndices[mappingData[h]]] : '')
-    );
-
-    const targetSheet = ss.getSheetByName(mappedTarget) || ss.insertSheet(mappedTarget);
-    targetSheet.clear();
-    targetSheet.appendRow(memberHeaders);
-    if (mappedData.length) {
-      targetSheet.getRange(targetStartRow, 1, mappedData.length, memberHeaders.length)
-        .setValues(mappedData);
+    // Get CSV file URL
+    const fileUrl = configSheet.getRange('B4').getValue();
+    const fileId = extractDriveFileId(fileUrl);
+    
+    if (!fileId) {
+      ui.alert('No CSV URL', 
+              'No CSV Drive URL is defined in the config. Please either:\n' +
+              '1. Add a Google Drive URL to the CSV file in the config, or\n' +
+              '2. Manually paste your CSV data into the "' + stagingSheet + '" sheet.',
+              ui.ButtonSet.OK);
+      
+      // Ensure staging sheet exists and activate it
+      const stgSheet = ensureStagingSheetExists();
+      stgSheet.activate();
+      return;
     }
-
-    configSheet.getRange('B6').setValue(new Date());
-    ui.alert(`Imported ${mappedData.length} records`);
+    
+    // Get the CSV data from Drive
+    try {
+      const csvContent = DriveApp.getFileById(fileId).getBlob().getDataAsString();
+      const csvData = Utilities.parseCsv(csvContent);
+      
+      // Ensure staging sheet exists
+      const stgSheet = ensureStagingSheetExists();
+      
+      // Clear and populate staging sheet
+      stgSheet.clear();
+      if (csvData.length > 0) {
+        stgSheet.getRange(1, 1, csvData.length, csvData[0].length).setValues(csvData);
+        ui.alert(`CSV imported successfully`, 
+                `Data from Drive has been imported to "${stagingSheet}" sheet.\n\n` +
+                `Next step: Run "Map CSV Data" to process the imported data.`,
+                ui.ButtonSet.OK);
+      } else {
+        throw new Error('CSV file appears to be empty');
+      }
+    } catch (csvError) {
+      throw new Error(`Failed to import CSV: ${csvError.message}`);
+    }
   } catch (e) {
     ui.alert(`Import Failed: ${e.message}`);
     Logger.log(e);
   }
 }
 
+
 /*********************************
 * 8. CHANGE TRACKING SYSTEM
 * Compares imported records to the member source sheet.
-* - Flags membership number changes and contact updates
+* - Flags membership number changes and tracked field updates
 * - Highlights changed cells and tags the Action column
-* - Ensures robust date and key normalization
+* - Normalizes dates (Excel serials, AU/ISO formats)
+* - Groups all debug output into a single log block per member
+* Last updated: 2025-05-08
 *********************************/
 function compareAndFlagChanges() {
   const ss = SpreadsheetApp.getActive();
-  const { memberSource, mappedTarget } = getSheetNamesFromConfig();
   const ui = SpreadsheetApp.getUi();
+  const { memberSource, mappedTarget } = getSheetNamesFromConfig();
+
+  // Read configuration from Import Config sheet
+  const config = getImportConfigParams();
+  const SHOW_NUMBER_CHANGE_PROMPTS = config.SHOW_NUMBER_CHANGE_PROMPTS;
+  const AUTO_UPDATE_NUMBER_CHANGES = config.AUTO_UPDATE_NUMBER_CHANGES;
+  const DEBUG_MODE = config.DEBUG_MODE;
+  const DATE_INPUT_FORMAT = config.DATE_INPUT_FORMAT;
+  const TARGET_TIMEZONE = ss.getSpreadsheetTimeZone();
 
   const TRACKED_FIELDS = [
-    'Medical Info', 'Member Mobile', 'Member_Email',
-    'Additional Email Addresses', 'Parent1_Mobile',
-    'Parent1_Email', 'Parent2_Mobile', 'Parent2_Email', 'Address'
+    'Medical Info', 'Member Mobile', 'Member_Email', 'Additional Email Addresses', 
+    'Parent1_Mobile', 'Parent1_Email', 'Parent2_Mobile', 'Parent2_Email', 'Address'
   ];
-  const HIGHLIGHT_COLOR = '#800080'; // purple for changes
+  const HIGHLIGHT_COLOR = '#800080';
   const TEXT_COLOR = '#ffffff';
-  const NEW_MEMBER_COLOR = '#e6ffec'; // light green for new members
+  const NEW_MEMBER_COLOR = '#e6ffec';
+  const UPDATED_NUMBER_COLOR = '#800080';
 
-  // Normalize DOB to yyyy-MM-dd string for reliable matching
-  const normalizeDOB = (dateValue) => {
-    if (!dateValue) return '';
-    try {
-      const date = new Date(dateValue);
-      return Utilities.formatDate(date, 'Australia/Sydney', 'yyyy-MM-dd');
-    } catch(e) {
-      return '';
-    }
-  };
+  // Composite key generator with debug logging
+  const createCompositeKey = (row, headers, context, debugLines) => {
+    const getValue = (field) => {
+      const idx = headers.indexOf(field);
+      if (idx === -1) return '';
+      const val = row[idx];
+      return typeof val === 'string' 
+        ? val.trim().normalize('NFKC').replace(/\s+/g, ' ').toLowerCase()
+        : String(val).trim().toLowerCase();
+    };
 
-  // Create composite key from first name, last name, DOB (all lowercase, trimmed)
-  const createCompositeKey = (row, headers) => {
-    const firstName = (row[headers.indexOf('First Name')] || '').toString().trim().toLowerCase();
-    const lastName = (row[headers.indexOf('Last Name')] || '').toString().trim().toLowerCase();
-    const dob = normalizeDOB(row[headers.indexOf('D.O.B')]);
-    return `${firstName}|${lastName}|${dob}`;
+    const dob = normalizeDate(
+      row[headers.indexOf('D.O.B')],
+      context,
+      debugLines,
+      DATE_INPUT_FORMAT,
+      TARGET_TIMEZONE
+    );
+    const firstName = getValue('First Name');
+    const lastName = getValue('Last Name');
+    const key = `${firstName}|${lastName}|${dob}`;
+    debugLines && debugLines.push(`[${context}] Composite key: ${key}`);
+    return {
+      membershipId: String(getValue('Membership Number')).trim(),
+      nameDob: key
+    };
   };
 
   try {
     const memberSheet = ss.getSheetByName(memberSource);
-    const memberData = memberSheet.getDataRange().getDisplayValues();
+    const memberData = memberSheet.getDataRange().getValues();
     const memberHeaders = memberData[0];
-    const memberMap = new Map(memberData.slice(1).map(row => [
-      createCompositeKey(row, memberHeaders),
-      row
-    ]));
+
+    // Build multi-key map
+    const memberMap = new Map();
+    memberData.slice(1).forEach((row, idx) => {
+      let debugLines = [];
+      const keys = createCompositeKey(row, memberHeaders, 'SOURCE', debugLines);
+      const rowNum = idx + 2;
+      if (keys.membershipId) {
+        memberMap.set(`id:${keys.membershipId}`, { row, rowNum, keys });
+      }
+      memberMap.set(keys.nameDob, { row, rowNum, keys });
+      if (DEBUG_MODE) {
+        debugLines.unshift(`--- [SOURCE] Row ${rowNum} ---`);
+        console.log(debugLines.join('\n'));
+      }
+    });
 
     const targetSheet = ss.getSheetByName(mappedTarget);
-    const targetData = targetSheet.getDataRange().getDisplayValues();
+    const targetData = targetSheet.getDataRange().getValues();
     let targetHeaders = targetData[0];
 
     // Ensure Action column exists
     let actionColIdx = targetHeaders.indexOf('Action');
     if (actionColIdx === -1) {
-      targetSheet.insertColumnAfter(1);
-      actionColIdx = 1;
-      targetSheet.getRange(1, 2).setValue('Action');
+      targetSheet.insertColumnAfter(targetHeaders.length);
+      actionColIdx = targetHeaders.length;
+      targetSheet.getRange(1, actionColIdx + 1).setValue('Action');
       targetHeaders = targetSheet.getRange(1, 1, 1, targetSheet.getLastColumn()).getValues()[0];
     }
 
     const actions = [];
     const backgrounds = [];
     const fontColors = [];
+    const numberChanges = [];
 
     for (let rowIndex = 1; rowIndex < targetData.length; rowIndex++) {
+      let debugLines = [];
       const row = targetData[rowIndex];
-      const key = createCompositeKey(row, targetHeaders);
-      const memberRow = memberMap.get(key);
-      let actionNotes = [];
+      const targetKeys = createCompositeKey(row, targetHeaders, 'TARGET', debugLines);
+      let memberMatch = null;
+      let matchType = '';
+
+      // 1. Priority match by exact membership ID
+      if (targetKeys.membershipId) {
+        memberMatch = memberMap.get(`id:${targetKeys.membershipId}`);
+        matchType = 'id';
+      }
+
+      // 2. Fallback to name/DOB match
+      if (!memberMatch) {
+        memberMatch = memberMap.get(targetKeys.nameDob);
+        matchType = 'nameDob';
+      }
+
       backgrounds[rowIndex] = new Array(targetHeaders.length).fill(null);
       fontColors[rowIndex] = new Array(targetHeaders.length).fill(null);
+      let actionNotes = [];
 
-      if (memberRow) {
-        // Membership number change detection
-        const memberNumIdx = targetHeaders.indexOf('Membership Number');
-        if (memberNumIdx > -1) {
-          const oldNum = memberRow[memberHeaders.indexOf('Membership Number')];
-          const newNum = row[memberNumIdx];
-          if (oldNum !== newNum) {
-            actionNotes.push('New Number');
-            backgrounds[rowIndex][memberNumIdx] = HIGHLIGHT_COLOR;
-            fontColors[rowIndex][memberNumIdx] = TEXT_COLOR;
-          }
+      if (memberMatch) {
+        debugLines.push(`[MATCH] Source key: ${memberMatch.keys.nameDob}`);
+        const sourceId = String(memberMatch.row[memberHeaders.indexOf('Membership Number')]).trim();
+        const targetId = String(targetKeys.membershipId).trim();
+
+        // ID change detection
+        if (sourceId !== targetId && matchType === 'nameDob') {
+          debugLines.push(`[ID CHANGE] ${sourceId} -> ${targetId}`);
+          debugLines.push(`[ID CHANGE] Source key: ${memberMatch.keys.nameDob}`);
+          debugLines.push(`[ID CHANGE] Target key: ${targetKeys.nameDob}`);
+          numberChanges.push({
+            sourceId,
+            targetId,
+            name: `${row[targetHeaders.indexOf('First Name')]} ${row[targetHeaders.indexOf('Last Name')]}`,
+            rowNum: memberMatch.rowNum
+          });
+          actionNotes.push('Member ID Changed');
+          const idCol = targetHeaders.indexOf('Membership Number');
+          backgrounds[rowIndex][idCol] = UPDATED_NUMBER_COLOR;
+          fontColors[rowIndex][idCol] = TEXT_COLOR;
         }
 
-        // Contact field change detection
-        let contactChanged = false;
+        // Field changes
+        let changesDetected = false;
         TRACKED_FIELDS.forEach(field => {
           const targetIdx = targetHeaders.indexOf(field);
-          const memberIdx = memberHeaders.indexOf(field);
-          if (targetIdx > -1 && memberIdx > -1) {
-            if (row[targetIdx] !== memberRow[memberIdx]) {
-              contactChanged = true;
+          const sourceIdx = memberHeaders.indexOf(field);
+          if (targetIdx > -1 && sourceIdx > -1) {
+            const sourceVal = memberMatch.row[sourceIdx];
+            const targetVal = row[targetIdx];
+            const normalize = (val) => {
+              if (val instanceof Date) return val.getTime();
+              return String(val).trim().toLowerCase();
+            };
+            if (normalize(sourceVal) !== normalize(targetVal)) {
+              changesDetected = true;
+              debugLines.push(`[FIELD CHANGE] ${field}: "${sourceVal}" -> "${targetVal}"`);
               backgrounds[rowIndex][targetIdx] = HIGHLIGHT_COLOR;
               fontColors[rowIndex][targetIdx] = TEXT_COLOR;
             }
           }
         });
-        if (contactChanged) actionNotes.push('Updated Contact');
+        if (changesDetected) actionNotes.push('Field Updates');
       } else {
-        // New member detected (no match in source)
+        debugLines.push('[NO MATCH] No member found for this composite key.');
         actionNotes.push('New Member');
-        backgrounds[rowIndex] = new Array(targetHeaders.length).fill(NEW_MEMBER_COLOR);
+        backgrounds[rowIndex].fill(NEW_MEMBER_COLOR);
       }
 
       actions[rowIndex] = [actionNotes.join(', ')];
+      if (DEBUG_MODE) {
+        debugLines.unshift(`--- [TARGET] Row ${rowIndex + 1} ---`);
+        console.log(debugLines.join('\n'));
+      }
     }
 
-    // Header row for actions and formatting
+    // Batch process number changes at the end
+    if (numberChanges.length > 0 && SHOW_NUMBER_CHANGE_PROMPTS) {
+      const changeList = numberChanges.map((change, index) => 
+        `\n${index + 1}. ${change.name}: ${change.sourceId} → ${change.targetId}`
+      ).join('');
+
+      const response = ui.alert(
+        'Membership Number Changes Detected',
+        `Found ${numberChanges.length} number changes:${changeList}\n\nApply all changes?`,
+        ui.ButtonSet.YES_NO
+      );
+
+      if (response === ui.Button.YES) {
+        updateMemberNumbers(memberSource, memberHeaders, numberChanges);
+      }
+    }
+
+    // Apply formatting
     actions[0] = [targetHeaders[actionColIdx] || 'Action'];
     backgrounds[0] = new Array(targetHeaders.length).fill(null);
     fontColors[0] = new Array(targetHeaders.length).fill(null);
 
-    // Write Action column
     targetSheet.getRange(1, actionColIdx + 1, actions.length, 1).setValues(actions);
+    const lastRow = targetData.length;
+    const lastCol = targetHeaders.length;
+    targetSheet.getRange(2, 1, lastRow - 1, lastCol)
+      .setBackgrounds(backgrounds.slice(1))
+      .setFontColors(fontColors.slice(1));
 
-    // Apply background and font color formatting
-    for (let colIndex = 0; colIndex < targetHeaders.length; colIndex++) {
-      const colBgs = backgrounds.map(row => row[colIndex] || null);
-      const colFonts = fontColors.map(row => row[colIndex] || null);
-      targetSheet.getRange(1, colIndex + 1, colBgs.length, 1)
-        .setBackgrounds(colBgs.map(bg => [bg]))
-        .setFontColors(colFonts.map(fc => [fc]));
-    }
-
-    ui.alert('Change Tracking Complete');
+    ui.alert(`${targetData.length - 1} Records Processed.\n${numberChanges.length} ID changes detected.`);
   } catch (e) {
-    ui.alert(`Change Tracking Failed: ${e.message}`);
-    Logger.log(e.stack || e.message);
+    ui.alert(`Error: ${e.message}`);
+    console.error(e);
+    Logger.log(e.stack || e);
   }
 }
 
+/*********************************
+* DATE NORMALISATION UTILITIES
+* Handles multiple date formats and regions:
+* - Excel serial dates
+* - ISO, AU, and US formats
+* - Fallback to JavaScript Date parsing
+* Configurable via parameters for input format and timezone
+*********************************/
+function normalizeDate(
+  dateValue, 
+  context = '', 
+  debugLines = null, 
+  dateInputFormat = 'International (AU)', 
+  targetTimezone = 'Australia/Sydney'
+) {
+  if (!dateValue) return '';
+  try {
+    debugLines && debugLines.push(`[${context}] Raw date value: ${dateValue} (${typeof dateValue})`);
 
-    // Fill header row for actions and formatting
-    actions[0] = [targetHeaders[actionColIdx] || 'Action'];
-    backgrounds[0] = new Array(targetHeaders.length).fill(null);
-    fontColors[0] = new Array(targetHeaders.length).fill(null);
-
-    // Update Action column
-    targetSheet.getRange(1, actionColIdx + 1, actions.length, 1)
-      .setValues(actions);
-
-    // Apply formatting for highlighted changes
-    for (let colIndex = 0; colIndex < targetHeaders.length; colIndex++) {
-      const colBgs = backgrounds.map(row => row[colIndex] || null);
-      const colFonts = fontColors.map(row => row[colIndex] || null);
-      targetSheet.getRange(1, colIndex + 1, colBgs.length, 1)
-        .setBackgrounds(colBgs.map(bg => [bg]))
-        .setFontColors(colFonts.map(fc => [fc]));
+    // 1. Handle Excel serial numbers
+    if (typeof dateValue === 'number') {
+      const excelEpoch = new Date('1899-12-30T00:00:00Z');
+      const jsDate = new Date(excelEpoch.getTime() + Math.round(dateValue) * 86400000);
+      const isoDate = Utilities.formatDate(jsDate, targetTimezone, 'yyyy-MM-dd');
+      debugLines && debugLines.push(`[${context}] Excel serial ${dateValue} → ${isoDate}`);
+      return isoDate;
     }
 
-    ui.alert('Change Tracking Complete');
-  } catch (e) {
-    ui.alert(`Change Tracking Failed: ${e.message}`);
-    Logger.log(e.stack || e.message);
+    // 2. Handle string dates based on configured format
+    if (typeof dateValue === 'string') {
+      let match, year, month, day;
+      
+      // ISO 8601 Format (YYYY-MM-DD)
+      if (dateInputFormat === 'ISO') {
+        match = dateValue.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+        if (match) ([, year, month, day] = match);
+      }
+      // International/AU Format (DD/MM/YYYY or DD/MM/YY)
+      else if (dateInputFormat === 'International (AU)') {
+        match = dateValue.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4}|\d{2})$/);
+        if (match) ([, day, month, year] = match);
+      }
+      // US Format (MM/DD/YYYY or MM/DD/YY)
+      else if (dateInputFormat === 'US') {
+        match = dateValue.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4}|\d{2})$/);
+        if (match) ([, month, day, year] = match);
+      }
+
+      if (match) {
+        // Handle 2-digit years
+        year = year.length === 2 ? `20${year}` : year;
+        // Pad single-digit months/days
+        month = month.padStart(2, '0');
+        day = day.padStart(2, '0');
+        const isoDate = `${year}-${month}-${day}`;
+        debugLines && debugLines.push(`[${context}] Formatted ${dateInputFormat} date: ${dateValue} → ${isoDate}`);
+        return isoDate;
+      }
+    }
+
+    // 3. Fallback to JS Date parsing
+    const date = dateValue instanceof Date ? dateValue : new Date(dateValue);
+    const isoDate = Utilities.formatDate(date, targetTimezone, 'yyyy-MM-dd');
+    if (isNaN(date.getTime())) throw new Error('Invalid Date');
+    debugLines && debugLines.push(`[${context}] Parsed fallback date: ${dateValue} → ${isoDate}`);
+    return isoDate;
+  } catch(e) {
+    debugLines && debugLines.push(`[${context}] Date error: ${dateValue} → ${e.message}`);
+    return 'invalid-date';
   }
 }
+
+/*********************************
+ * UPDATE MEMBER NUMBERS
+ * Sub-function to update member numbers in the source sheet based on the provided changes array.
+ * @param {string} memberSource - The name of the member source sheet.
+ * @param {Array} memberHeaders - The headers of the member source sheet.
+ * @param {Array} numberChanges - Array of objects: {rowNum, targetId, name, sourceId}
+*********************************/
+function updateMemberNumbers(memberSource, memberHeaders, numberChanges) {
+  const ss = SpreadsheetApp.getActive();
+  const ui = SpreadsheetApp.getUi();
+  const memberSheet = ss.getSheetByName(memberSource);
+  let updateCount = 0;
+  let changeList = '';
+  
+  try {
+    numberChanges.forEach((change, idx) => {
+      memberSheet.getRange(change.rowNum, memberHeaders.indexOf('Membership Number') + 1)
+        .setValue(change.targetId);
+      updateCount++;
+      changeList += `\n${idx + 1}. ${change.name}: ${change.sourceId} → ${change.targetId}`;
+    });
+    ui.alert(`Successfully updated ${updateCount} membership numbers:${changeList}`);
+  } catch (e) {
+    ui.alert(`Member number update failed: ${e.message}`);
+    Logger.log(e);
+  }
+}
+
