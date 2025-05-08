@@ -377,13 +377,13 @@ function compareAndFlagChanges() {
   const TRACKED_FIELDS = [
     'Medical Info', 'Member Mobile', 'Member_Email',
     'Additional Email Addresses', 'Parent1_Mobile',
-    'Parent1_Email', 'Parent2_Mobile', 'Parent2_Email',
-    'Home_Number', 'Address'
+    'Parent1_Email', 'Parent2_Mobile', 'Parent2_Email', 'Address'
   ];
-  const HIGHLIGHT_COLOR = '#800080';
+  const HIGHLIGHT_COLOR = '#800080'; // purple for changes
   const TEXT_COLOR = '#ffffff';
+  const NEW_MEMBER_COLOR = '#e6ffec'; // light green for new members
 
-  // Robust date normalization for composite key
+  // Normalize DOB to yyyy-MM-dd string for reliable matching
   const normalizeDOB = (dateValue) => {
     if (!dateValue) return '';
     try {
@@ -394,7 +394,7 @@ function compareAndFlagChanges() {
     }
   };
 
-  // Composite key generator for matching
+  // Create composite key from first name, last name, DOB (all lowercase, trimmed)
   const createCompositeKey = (row, headers) => {
     const firstName = (row[headers.indexOf('First Name')] || '').toString().trim().toLowerCase();
     const lastName = (row[headers.indexOf('Last Name')] || '').toString().trim().toLowerCase();
@@ -415,6 +415,7 @@ function compareAndFlagChanges() {
     const targetData = targetSheet.getDataRange().getDisplayValues();
     let targetHeaders = targetData[0];
 
+    // Ensure Action column exists
     let actionColIdx = targetHeaders.indexOf('Action');
     if (actionColIdx === -1) {
       targetSheet.insertColumnAfter(1);
@@ -435,35 +436,66 @@ function compareAndFlagChanges() {
       backgrounds[rowIndex] = new Array(targetHeaders.length).fill(null);
       fontColors[rowIndex] = new Array(targetHeaders.length).fill(null);
 
-      // Membership number change detection
-      const memberNumIdx = targetHeaders.indexOf('Membership Number');
-      if (memberNumIdx > -1 && memberRow) {
-        const oldNum = memberRow[memberHeaders.indexOf('Membership Number')];
-        const newNum = row[memberNumIdx];
-        if (oldNum !== newNum) {
-          actionNotes.push('New Number');
-          backgrounds[rowIndex][memberNumIdx] = HIGHLIGHT_COLOR;
-          fontColors[rowIndex][memberNumIdx] = TEXT_COLOR;
-        }
-      }
-
-      // Contact field change detection
-      let contactChanged = false;
-      TRACKED_FIELDS.forEach(field => {
-        const targetIdx = targetHeaders.indexOf(field);
-        const memberIdx = memberHeaders.indexOf(field);
-        if (targetIdx > -1 && memberIdx > -1 && memberRow) {
-          if (row[targetIdx] !== memberRow[memberIdx]) {
-            contactChanged = true;
-            backgrounds[rowIndex][targetIdx] = HIGHLIGHT_COLOR;
-            fontColors[rowIndex][targetIdx] = TEXT_COLOR;
+      if (memberRow) {
+        // Membership number change detection
+        const memberNumIdx = targetHeaders.indexOf('Membership Number');
+        if (memberNumIdx > -1) {
+          const oldNum = memberRow[memberHeaders.indexOf('Membership Number')];
+          const newNum = row[memberNumIdx];
+          if (oldNum !== newNum) {
+            actionNotes.push('New Number');
+            backgrounds[rowIndex][memberNumIdx] = HIGHLIGHT_COLOR;
+            fontColors[rowIndex][memberNumIdx] = TEXT_COLOR;
           }
         }
-      });
-      if (contactChanged) actionNotes.push('Updated Contact');
+
+        // Contact field change detection
+        let contactChanged = false;
+        TRACKED_FIELDS.forEach(field => {
+          const targetIdx = targetHeaders.indexOf(field);
+          const memberIdx = memberHeaders.indexOf(field);
+          if (targetIdx > -1 && memberIdx > -1) {
+            if (row[targetIdx] !== memberRow[memberIdx]) {
+              contactChanged = true;
+              backgrounds[rowIndex][targetIdx] = HIGHLIGHT_COLOR;
+              fontColors[rowIndex][targetIdx] = TEXT_COLOR;
+            }
+          }
+        });
+        if (contactChanged) actionNotes.push('Updated Contact');
+      } else {
+        // New member detected (no match in source)
+        actionNotes.push('New Member');
+        backgrounds[rowIndex] = new Array(targetHeaders.length).fill(NEW_MEMBER_COLOR);
+      }
 
       actions[rowIndex] = [actionNotes.join(', ')];
     }
+
+    // Header row for actions and formatting
+    actions[0] = [targetHeaders[actionColIdx] || 'Action'];
+    backgrounds[0] = new Array(targetHeaders.length).fill(null);
+    fontColors[0] = new Array(targetHeaders.length).fill(null);
+
+    // Write Action column
+    targetSheet.getRange(1, actionColIdx + 1, actions.length, 1).setValues(actions);
+
+    // Apply background and font color formatting
+    for (let colIndex = 0; colIndex < targetHeaders.length; colIndex++) {
+      const colBgs = backgrounds.map(row => row[colIndex] || null);
+      const colFonts = fontColors.map(row => row[colIndex] || null);
+      targetSheet.getRange(1, colIndex + 1, colBgs.length, 1)
+        .setBackgrounds(colBgs.map(bg => [bg]))
+        .setFontColors(colFonts.map(fc => [fc]));
+    }
+
+    ui.alert('Change Tracking Complete');
+  } catch (e) {
+    ui.alert(`Change Tracking Failed: ${e.message}`);
+    Logger.log(e.stack || e.message);
+  }
+}
+
 
     // Fill header row for actions and formatting
     actions[0] = [targetHeaders[actionColIdx] || 'Action'];
